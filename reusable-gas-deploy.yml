@@ -1,0 +1,81 @@
+name: Reusable Apps Script Deploy
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '20'
+      deployment_id:
+        description: 'The Apps Script Deployment ID from GitHub Vars'
+        required: true
+        type: string
+    secrets:
+      CLASPRC_JSON:
+        required: true
+      TEST_SECRET:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Create clasprc.json
+        run: echo "$CLASPRC_JSON" > ~/.clasprc.json
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+
+      - name: Push to Apps Script
+        run: npx clasp push --force
+
+      - name: Run Remote Tests
+        id: run_tests
+        run: |
+          DEPLOY_OUTPUT=$(npx clasp deploy --description "Temp Test" --json)
+          TEMP_DEPLOY_ID=$(echo "$DEPLOY_OUTPUT" | jq -r '.deploymentId')
+          
+          if [ -z "$TEMP_DEPLOY_ID" ] || [ "$TEMP_DEPLOY_ID" == "null" ]; then exit 1; fi
+          
+          trap 'npx clasp undeploy "$TEMP_DEPLOY_ID" || true' EXIT
+
+          WEBAPP_URL="https://script.google.com/macros/s/$TEMP_DEPLOY_ID/exec?test=true&secret=${TEST_SECRET:-}"
+          RESPONSE=$(curl -sL "$WEBAPP_URL")
+
+          echo "Raw response: $RESPONSE"
+          
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Tests failed!"
+            exit 1 
+          fi
+        env:
+          TEST_SECRET: ${{ secrets.TEST_SECRET }}
+
+      - name: Rollback to Last Deployment
+        if: failure() && steps.run_tests.outcome == 'failure'
+        run: |
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          git fetch origin "$DEFAULT_BRANCH"
+          git reset --hard "origin/$DEFAULT_BRANCH"
+          npx clasp push --force
+        env:
+          DEPLOY_ID: ${{ inputs.deployment_id }}
+
+      - name: Deploy Web App
+        # Only deploy if on the default branch and tests passed
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && success()
+        run: npx clasp deploy --deploymentId "$DEPLOY_ID" --description "Auto-deploy"
+        env:
+          DEPLOY_ID: ${{ inputs.deployment_id }}
