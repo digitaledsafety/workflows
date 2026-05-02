@@ -91,7 +91,7 @@ jobs:
         uses: actions/deploy-pages@v4
 
   android-package:
-    if: inputs.android-enabled && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+    #if: inputs.android-enabled && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     needs: build-and-test
     runs-on: ubuntu-latest
     permissions:
