@@ -13,6 +13,28 @@ on:
         default: '20'
         required: false
         type: string
+      pwa-url:
+        description: 'The URL where the PWA is deployed (required for Android packaging)'
+        required: false
+        type: string
+      android-enabled:
+        description: 'Enable Android app packaging'
+        default: false
+        required: false
+        type: boolean
+    secrets:
+      android-keystore:
+        description: 'Base64 encoded Android keystore'
+        required: false
+      android-keystore-password:
+        description: 'Android keystore password'
+        required: false
+      android-key-alias:
+        description: 'Android key alias'
+        required: false
+      android-key-password:
+        description: 'Android key password'
+        required: false
 
 jobs:
   build-and-test:
@@ -51,8 +73,10 @@ jobs:
           path: _site
 
   deploy:
-    # Only deploy if calling from the main branch
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # Deploy on push to main branch or on release
+    if: |
+      (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'release')
     needs: build-and-test
     permissions:
       pages: write
@@ -65,3 +89,139 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  android-package:
+    #if: inputs.android-enabled && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to upload assets to the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Bubblewrap
+        run: npm install -g @bubblewrap/cli
+
+      - name: Build Android App
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.android-keystore }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.android-keystore-password }}
+          ANDROID_KEY_ALIAS: ${{ secrets.android-key-alias }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.android-key-password }}
+        run: |
+          if [ -z "${{ inputs.pwa-url }}" ]; then
+            echo "::error::pwa-url input is required for Android packaging."
+            exit 1
+          fi
+
+          # Non-interactive configuration for Bubblewrap
+          mkdir -p ~/.bubblewrap
+          cat <<EOF > ~/.bubblewrap/config.json
+          {
+            "jdkPath": "${JAVA_HOME}",
+            "androidSdkPath": "${ANDROID_SDK_ROOT}"
+          }
+          EOF
+
+          # Initialize Android project if twa-manifest.json is missing
+          if [ ! -f "twa-manifest.json" ]; then
+            echo "Initializing Android project from ${{ inputs.pwa-url }}..."
+            # Non-interactive init using yes to accept defaults.
+            yes "" | bubblewrap init --manifest "${{ inputs.pwa-url }}"
+          fi
+
+          # Update appVersion from release tag if applicable, regardless of keystore presence
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            export TAG_VERSION="${GITHUB_REF_NAME}"
+            if [[ $TAG_VERSION == v* ]]; then
+                TAG_VERSION="${TAG_VERSION:1}"
+            fi
+            python3 -c "
+            import json, os
+            if os.path.exists('twa-manifest.json'):
+                with open('twa-manifest.json', 'r') as f:
+                    data = json.load(f)
+                data['appVersion'] = os.environ.get('TAG_VERSION', '1.0.0')
+                with open('twa-manifest.json', 'w') as f:
+                    json.dump(data, f, indent=2)
+            "
+          fi
+
+          # Handle Signing
+          if [ -n "$ANDROID_KEYSTORE" ]; then
+            echo "Using provided keystore..."
+            echo "$ANDROID_KEYSTORE" | base64 -d > release.keystore
+
+            export ALIAS="${ANDROID_KEY_ALIAS:-android}"
+
+            # Update twa-manifest.json to point to the decoded keystore and set alias
+            python3 -c "
+            import json, os
+            if os.path.exists('twa-manifest.json'):
+                with open('twa-manifest.json', 'r') as f:
+                    data = json.load(f)
+                data['signingKey'] = {
+                    'path': os.path.abspath('release.keystore'),
+                    'alias': os.environ.get('ALIAS', 'android')
+                }
+                with open('twa-manifest.json', 'w') as f:
+                    json.dump(data, f, indent=2)
+            "
+            bubblewrap build --keystorePassword "$ANDROID_KEYSTORE_PASSWORD" --keyPassword "$ANDROID_KEY_PASSWORD"
+          else
+            echo "No keystore provided. Bubblewrap will generate one."
+            # Use 'password' as a default if none provided, to ensure non-interactive build
+            # 'yes' is used to answer prompt about generating a new keystore
+            yes "" | bubblewrap build --keystorePassword "${ANDROID_KEYSTORE_PASSWORD:-password}" --keyPassword "${ANDROID_KEY_PASSWORD:-password}"
+          fi
+
+      - name: Extract Signing Key Fingerprint
+        run: |
+          KEYSTORE_FILE=$(python3 -c "import json, os; print(json.load(open('twa-manifest.json'))['signingKey']['path'])" || echo "")
+          if [ -z "$KEYSTORE_FILE" ] || [ ! -f "$KEYSTORE_FILE" ]; then
+             KEYSTORE_FILE=$(ls *.keystore 2>/dev/null | head -n 1)
+          fi
+
+          if [ -f "$KEYSTORE_FILE" ]; then
+            echo "--- SIGNING KEY FINGERPRINT (SHA256) ---"
+            # Get password from manifest or defaults
+            PASS=$(python3 -c "import json, os; print(os.environ.get('ANDROID_KEYSTORE_PASSWORD') or 'password')" || echo "password")
+            keytool -list -v -keystore "$KEYSTORE_FILE" -storepass "$PASS" | grep SHA256
+            echo "----------------------------------------"
+          else
+            echo "Keystore file not found, skipping fingerprint extraction."
+          fi
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.android-keystore-password }}
+
+      - name: Upload Android Artifacts to Workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-artifacts
+          path: |
+            *.apk
+            *.aab
+            *.keystore
+            twa-manifest.json
+            assetlinks.json
+
+      - name: Attach Artifacts to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.apk
+            *.aab
+            assetlinks.json
