@@ -45,13 +45,25 @@ jobs:
       - name: Run Playwright tests
         run: npx playwright test
 
+      - name: Prepare artifact structure based on branch
+        run: |
+          mkdir -p public
+          if [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            echo "Main branch detected: Preparing root deployment structure."
+            cp -r _site/* public/
+          else
+            echo "Feature/Bug branch detected: Placing site in subfolder '${{ github.ref_name }}'."
+            mkdir -p public/${{ github.ref_name }}
+            cp -r _site/* public/${{ github.ref_name }}/
+          fi
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: public
 
   deploy:
-    # Only deploy if calling from the main branch
+    # Only deploy to the live site if it's the default (main/master) branch
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: build-and-test
     permissions:
