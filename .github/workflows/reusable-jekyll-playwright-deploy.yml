@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch full history so we can checkout the default branch during feature builds
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
@@ -27,8 +29,14 @@ jobs:
           ruby-version: ${{ inputs.ruby-version }}
           bundler-cache: true
 
-      - name: Build with Jekyll
-        run: bundle exec jekyll build
+      - name: Build current branch with Jekyll
+        run: |
+          if [ "${{ github.ref_name }}" = "${{ github.event.repository.default_branch }}" ]; then
+            bundle exec jekyll build
+          else
+            # Pass baseurl so assets and relative links work under the subfolder path
+            bundle exec jekyll build --baseurl "/${{ github.ref_name }}"
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -45,14 +53,36 @@ jobs:
       - name: Run Playwright tests
         run: npx playwright test
 
+      - name: Prepare artifact structure based on branch
+        run: |
+          mkdir -p public
+
+          if [ "${{ github.ref_name }}" = "${{ github.event.repository.default_branch }}" ]; then
+            echo "Main branch detected: Preparing root deployment structure."
+            cp -r _site/* public/
+          else
+            echo "Feature/Bug branch detected: Assembling site with root main site and subfolder preview."
+            
+            # Save the current feature site build
+            mkdir -p /tmp/feature_site
+            cp -r _site/* /tmp/feature_site/
+
+            # Checkout and build the default branch to serve at the root directory
+            git checkout ${{ github.event.repository.default_branch }}
+            bundle exec jekyll build --destination _site_main
+            cp -r _site_main/* public/
+
+            # Copy the feature branch output into its dedicated subfolder
+            mkdir -p "public/${{ github.ref_name }}"
+            cp -r /tmp/feature_site/* "public/${{ github.ref_name }}/"
+          fi
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: public
 
   deploy:
-    # Only deploy if calling from the main branch
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: build-and-test
     permissions:
       pages: write
